@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  gnaf-creater to creater 1 LARGE csv with every address in Australia
+
+Parameters:
+  BucketName1:
+    Description: Name of the bucket
+    Type: String
+    Default: industrydatagnaf
+
+  LogLevel:
+    Description: What level to log
+    Type: String
+    Default: DEBUG
+
+  SolutionEnvironment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - uat
+      - prod
+    Description: Enter the environment (dev,uat,prod) the default is dev
+
+Resources:
+  NewGnafAvailRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: "Every 3 months trigger lambda to download gnaf files"
+      Name: !Sub "NewGnafAvailRule-${SolutionEnvironment}"
+      ScheduleExpression: "cron(0 0 15 2-12/3 ? *)"
+      #State: "DISABLED"
+      Targets:
+        - Arn: !Sub "arn:aws:lambda:ap-southeast-2:159025770342:function:GnafDownloader-${SolutionEnvironment}"
+          Id: !Sub GnafDownloader-${SolutionEnvironment}
+  WebsiteToInvokeMyLambda:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Sub "GnafDownloader-${SolutionEnvironment}"
+      Principal: cloudwatch.amazonaws.com
+      SourceArn: !GetAtt NewGnafAvailRule.Arn
+
+  GnafDownloader:
+    Type: "AWS::Serverless::Function"
+    DeletionPolicy: "Delete"
+    Properties:
+      CodeUri: gnaf_downloader
+      Environment:
+        Variables:
+          BucketName1: !Ref BucketName1
+          SolutionEnvironment: !Ref SolutionEnvironment
+          LogLevel: !Ref LogLevel
+      Description: Downloads gnaf files from website and saves on s3 bucket
+      FunctionName: !Sub "GnafDownloader-${SolutionEnvironment}"
+      Handler: GnafDownloader.lambda_handler
+      Role: arn:aws:iam::159025770342:role/service-role/tk_role_basic
+      Runtime: python3.7
+      Timeout: 90
+      MemorySize: 1000
+
+
+  MainBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${BucketName1}-${SolutionEnvironment}"
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt GnafUnzip.Arn
+
+  PermissionForS3ToInvokeMyLambda:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Sub "GnafUnzip-${SolutionEnvironment}"
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt MainBucket.Arn
+
+  GnafUnzip:
+    Type: "AWS::Serverless::Function"
+    DeletionPolicy: "Delete"
+    Properties:
+      CodeUri: gnaf_unzip
+      Handler: GnafUnzip.lambda_handler
+      Environment:
+        Variables:
+          BucketName1: !Ref BucketName1
+          SolutionEnvironment: !Ref SolutionEnvironment
+          LogLevel: !Ref LogLevel
+      Description: Unzips all psv files within downloaded zip then runs glue crawler to create athena tables
+      FunctionName: !Sub "GnafUnzip-${SolutionEnvironment}"
+      Role: arn:aws:iam::159025770342:role/basic_prem
+      Runtime: python3.7
+      Timeout: 600
+      MemorySize: 3008
+
+  CrawlerFinishedInvokeFunction:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: "When the crawler finishes it triggers the next function"
+      Name: !Sub "CrawlerFinishedInvokeFunction-${SolutionEnvironment}"
+      EventPattern:
+        source:
+          - aws.glue
+        detail-type:
+          - "Glue Crawler State Change"
+      Targets:
+        - Arn: "arn:aws:lambda:ap-southeast-2:159025770342:function:GnafQuery"
+          Id: GnafQuery
+
+  CrawlerToInvokeMyLambda:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Sub "GnafQuery-${SolutionEnvironment}"
+      Principal: cloudwatch.amazonaws.com
+      SourceArn: !GetAtt CrawlerFinishedInvokeFunction.Arn
+
+  GnafQuery:
+    Type: "AWS::Serverless::Function"
+    DeletionPolicy: "Delete"
+    Properties:
+      CodeUri: gnaf_query
+      Handler: GnafQuery.lambda_handler
+      Environment:
+        Variables:
+          BucketName1: !Ref BucketName1
+          SolutionEnvironment: !Ref SolutionEnvironment
+          LogLevel: !Ref LogLevel
+      Description: runs sql query in athena to produce statefiles
+      FunctionName: !Sub "GnafQuery-${SolutionEnvironment}"
+      Role: arn:aws:iam::159025770342:role/basic_prem
+      Runtime: python3.7
+      Timeout: 900
+      MemorySize: 3008
+      EventInvokeConfig:
+        DestinationConfig:
+          OnSuccess:
+            Type: SNS
+            Destination: !Ref GnafQueryStartTopic
+
+  GnafQueryStartTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub GnafQueryStartTopic-${SolutionEnvironment}
+      Subscription:
+        - Protocol: sqs
+          Endpoint: !GetAtt gnafqueue1.Arn
+
+  gnafqueue1:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub gnafqueue1-${SolutionEnvironment}
+      VisibilityTimeout: 900
+
+  LambdaFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt gnafqueue1.Arn
+      FunctionName: !GetAtt GnafMerger.Arn
+
+  GnafMerger:
+    Type: "AWS::Serverless::Function"
+    DeletionPolicy: "Delete"
+    Properties:
+      CodeUri: gnaf_merger
+      Handler: GnafMerger.lambda_handler
+      Environment:
+        Variables:
+          BucketName1: !Ref BucketName1
+          SolutionEnvironment: !Ref SolutionEnvironment
+          LogLevel: !Ref LogLevel
+      Description: merge all state files into AUS wide
+      FunctionName: !Sub "GnafMerger-${SolutionEnvironment}"
+      Role: arn:aws:iam::159025770342:role/basic_prem
+      Runtime: python3.7
+      Timeout: 900
+      MemorySize: 3008
